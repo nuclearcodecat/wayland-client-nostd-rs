@@ -5,7 +5,7 @@ use std::env;
 use crate::wayland::{Display, MessageManager, Registry};
 
 mod wayland {
-	use std::{env, io::{Read, Write}, os::unix::net::UnixStream, path::PathBuf};
+	use std::{env, io::{Read, Write}, os::unix::net::UnixStream, path::PathBuf, str::from_utf8};
 
 	pub struct Registry {
 		pub id: u32,
@@ -33,7 +33,21 @@ mod wayland {
 		NewId(u32),
 		NewIdSpecific(String, u32, u32),
 		Arr(Vec<u8>),
+		// u32?
 		FileDescriptor(u32),
+	}
+
+	#[derive(Debug)]
+	pub enum WireArgumentKind {
+		Int,
+		UnInt,
+		FixedPrecision,
+		String,
+		Obj,
+		NewId,
+		NewIdSpecific,
+		Arr,
+		FileDescriptor,
 	}
 
 	pub struct MessageManager {
@@ -88,7 +102,7 @@ mod wayland {
 			Ok(())
 		}
 
-		pub fn get_event(&mut self) -> Result<Option<Vec<WireMessage>>, ()> {
+		pub fn get_events(&mut self) -> Result<Option<Vec<WireMessage>>, ()> {
 			let mut b: Vec<u8> = vec![];
 			let len;
 			match self.sock.read_to_end(&mut b) {
@@ -127,6 +141,35 @@ mod wayland {
 					return Err(());
 				}
 				let opcode = (byte2 & 0x0000ffff) as usize;
+
+				match sender_id {
+					// add an IdManager or smth
+					// display
+					1 => {
+						match opcode {
+							0 => {
+								let obj_id = decode_event_payload(&b[cursor + 8..], WireArgumentKind::Obj)?;
+								let code = decode_event_payload(&b[cursor + 12..], WireArgumentKind::UnInt)?;
+								let message = decode_event_payload(&b[cursor + 16..], WireArgumentKind::String)?;
+								eprintln!("======== ERROR FIRED\nobj_id: {:?}\ncode: {:?}\nmessage: {:?}", obj_id, code, message);
+							},
+							_ => {
+								eprintln!("unimplemented");
+							},
+						}
+					},
+					// registry
+					2 => {
+						match opcode {
+							_ => {
+								eprintln!("unimplemented");
+							},
+						}
+					},
+					_ => {
+						eprintln!("unimplemented");
+					},
+				}
 
 				println!("==== iter {}\nsender_id: {}, recv_len: {}, opcode: {}, payload ->:\n{:?}", ctr, sender_id, recv_len, opcode, &b[cursor_last + 8..cursor_last + recv_len as usize]);
 
@@ -236,6 +279,41 @@ mod wayland {
 			})
 		}
 	}
+
+	fn decode_event_payload(payload: &[u8], kind: WireArgumentKind) -> Result<WireArgument, ()> {
+		let p = payload;
+		match kind {
+			WireArgumentKind::Int | WireArgumentKind::Obj | WireArgumentKind::NewId | WireArgumentKind::FileDescriptor | WireArgumentKind::FixedPrecision => {
+				Ok(WireArgument::Int(i32::from_ne_bytes([p[0], p[1], p[2], p[3]])))
+			},
+			WireArgumentKind::UnInt => {
+				Ok(WireArgument::UnInt(u32::from_ne_bytes([p[0], p[1], p[2], p[3]])))
+			},
+			WireArgumentKind::String => {
+				Ok(WireArgument::String(String::from_utf8(p.to_vec()).map_err(|_| {})?))
+			},
+			// not sure how to handle this
+			WireArgumentKind::NewIdSpecific => {
+				let nulterm = p.iter().enumerate().find(|(_, c)| **c == b'\0').map(|(e, _)| e);
+				if let Some(pos) = nulterm {
+					let slice = &p[0..pos];
+					let str_ = str::from_utf8(slice).map_err(|_| {})?;
+					let version = u32::from_ne_bytes([p[pos + 0], p[pos + 1], p[pos + 2], p[pos + 3]]);
+					let new_id = u32::from_ne_bytes([p[pos + 4], p[pos + 5], p[pos + 6], p[pos + 7]]);
+					Ok(WireArgument::NewIdSpecific(
+						str_.to_string(), 
+						version,
+						new_id
+					))
+				} else {
+					Err(())
+				}
+			},
+			WireArgumentKind::Arr => {
+				Ok(WireArgument::Arr(payload.to_vec()))
+			},
+		}
+	}
 }
 
 fn main() -> Result<(), ()> {
@@ -248,13 +326,9 @@ fn main() -> Result<(), ()> {
 	let mut registry = Registry::new(reg_id);
 	registry.wl_bind(&mut wlmm)?;
 
-	// let mut buf = String::new();
-	// let _ = wlmm.sock.read_to_string(&mut buf).unwrap();
-	// println!("read str: {}", buf);
-	
-	let mut read = wlmm.get_event()?;
+	let mut read = wlmm.get_events()?;
 	while read.is_none() {
-		read = wlmm.get_event()?;
+		read = wlmm.get_events()?;
 	}
 	println!("\n\n==== EVENT\n{:#?}", read);
 

@@ -2,13 +2,20 @@
 
 use std::env;
 
-use crate::wayland::{Display, MessageManager, Registry};
+use crate::wayland::{Display, IdManager, MessageManager, Registry};
 
 mod wayland {
-	use std::{env, io::{Read, Write}, os::unix::net::UnixStream, path::PathBuf, str::from_utf8};
+	use std::{collections::HashMap, env, io::{Read, Write}, os::unix::net::UnixStream, path::PathBuf};
+
+	#[derive(PartialEq, Eq, Hash)]
+	pub struct RegistryEntry {
+		interface: String,
+		version: u32,
+	}
 
 	pub struct Registry {
 		pub id: u32,
+		pub inner: HashMap<u32, RegistryEntry>,
 	}
 
 	pub struct Display {
@@ -129,7 +136,6 @@ mod wayland {
 			let mut events = vec![];
 			let mut cursor = 0;
 			let mut cursor_last = 0;
-			let mut ctr = 0;
 			while cursor < len {
 				let sender_id = u32::from_ne_bytes([b[cursor], b[cursor + 1], b[cursor + 2], b[cursor + 3]]);
 				let byte2 = u32::from_ne_bytes([b[cursor + 4], b[cursor + 5], b[cursor + 6], b[cursor + 7]]);
@@ -186,8 +192,6 @@ mod wayland {
 					},
 				}
 
-				// println!("==== iter {}\nsender_id: {}, recv_len: {}, opcode: {}, payload ->:\n{:?}", ctr, sender_id, recv_len, opcode, &b[cursor_last + 8..cursor_last + recv_len as usize]);
-
 				let event = WireMessage {
 					sender_id,
 					opcode,
@@ -196,7 +200,6 @@ mod wayland {
 				events.push(event);
 
 				cursor = cursor_last + recv_len as usize;
-				ctr += 1;
 				cursor_last = cursor;
 			}
 			Ok(Some(events))
@@ -241,33 +244,32 @@ mod wayland {
 	}
 
 	impl Display {
-		pub fn new() -> Self {
+		pub fn new(wlim: &mut IdManager) -> Self {
 			Self {
-				id: 1,
+				id: wlim.new_id(),
 			}
 		}
 
-		pub fn wl_get_registry(&mut self, wlmm: &mut MessageManager) -> Result<u32, ()> {
-			wlmm.increment_id();
+		pub fn wl_get_registry(&mut self, wlmm: &mut MessageManager, wlim: &mut IdManager) -> Result<u32, ()> {
+			let id = wlim.new_id();
 			wlmm.send_request(&mut WireMessage {
 				sender_id: self.id,
 				// second request in the proto
 				opcode: 1,
 				args: vec![
 					// wl_registry id is now 2 since 1 is the display
-					WireArgument::NewId(wlmm.last_ass_id),
+					WireArgument::NewId(id),
 				],
 			})?;
-			Ok(wlmm.last_ass_id)
+			Ok(id)
 		}
 
-		pub fn wl_sync(&mut self, wlmm: &mut MessageManager) -> Result<(), ()> {
-			wlmm.increment_id();
+		pub fn wl_sync(&mut self, wlmm: &mut MessageManager, wlim: &mut IdManager) -> Result<(), ()> {
 			wlmm.send_request(&mut WireMessage {
 				sender_id: self.id,
 				opcode: 0,
 				args: vec![
-					WireArgument::NewId(wlmm.last_ass_id),
+					WireArgument::NewId(wlim.new_id()),
 				],
 			})
 		}
@@ -277,11 +279,11 @@ mod wayland {
 		pub fn new(id: u32) -> Self {
 			Self {
 				id,
+				inner: HashMap::new(),
 			}
 		}
 
-		pub fn wl_bind(&mut self, wlmm: &mut MessageManager) -> Result<(), ()> {
-			wlmm.increment_id();
+		pub fn wl_bind(&mut self, wlmm: &mut MessageManager, wlim: &mut IdManager) -> Result<(), ()> {
 			wlmm.send_request(&mut WireMessage {
 				// wl_registry id
 				sender_id: self.id,
@@ -289,9 +291,17 @@ mod wayland {
 				opcode: 0,
 				args: vec![
 					WireArgument::UnInt(self.id),
-					WireArgument::NewId(wlmm.last_ass_id),
+					WireArgument::NewId(wlim.new_id()),
 				],
 			})
+		}
+
+		pub fn fill(&mut self, events: &Vec<WireMessage>) -> Result<(), ()> {
+			// for e in events {
+			// 	match 
+			// 	self.inner.insert(, v)
+			// }
+			todo!()
 		}
 	}
 
@@ -331,23 +341,38 @@ mod wayland {
 			},
 		}
 	}
+
+	#[derive(Default)]
+	pub struct IdManager {
+		top_id: u32,
+	}
+
+	impl IdManager {
+		pub fn new_id(&mut self) -> u32 {
+			self.top_id += 1;
+			println!("new id called, new id is {}", self.top_id);
+			self.top_id
+		}
+	}
 }
 
 fn main() -> Result<(), ()> {
 	let display_name = env::var("WAYLAND_DISPLAY").map_err(|_| {})?;
+	let mut wlim = IdManager::default();
 	let mut wlmm = MessageManager::new(&display_name)?;
-	let mut display = Display::new();
-	let reg_id = display.wl_get_registry(&mut wlmm)?;
-	println!("reg id: {}", reg_id);
-	display.wl_sync(&mut wlmm)?;
+	let mut display = Display::new(&mut wlim);
+	let reg_id = display.wl_get_registry(&mut wlmm, &mut wlim)?;
 	let mut registry = Registry::new(reg_id);
-	registry.wl_bind(&mut wlmm)?;
+
+	display.wl_sync(&mut wlmm, &mut wlim)?;
+	registry.wl_bind(&mut wlmm, &mut wlim)?;
 
 	let mut read = wlmm.get_events()?;
 	while read.is_none() {
 		read = wlmm.get_events()?;
 	}
 	println!("\n\n==== EVENT\n{:#?}", read);
+	registry.fill(&read.unwrap());
 
 	wlmm.discon()?;
 	println!("good");

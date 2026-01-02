@@ -21,8 +21,10 @@ fn main() -> Result<(), ()> {
 	while read.is_none() {
 		read = wlmm.get_events()?;
 	}
-	println!("\n\n==== EVENT\n{:#?}", read);
-	registry.fill(&read.unwrap());
+	// println!("\n\n==== EVENT\n{:#?}", read);
+	let read = &read.unwrap();
+	registry.fill(read)?;
+	println!("\n\n==== REGISTRY\n{:#?}", registry.inner);
 
 	wlmm.discon()?;
 	println!("good");

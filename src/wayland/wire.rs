@@ -93,7 +93,7 @@ impl MessageManager {
 		match self.sock.read_to_end(&mut b) {
 			Ok(l) => {
 				len = l;
-				println!("==== read to end\n{:?}", b);
+				// println!("==== read to end\n{:?}", b);
 				// if let Ok(str_) = str::from_utf8(&b) {
 				// 	println!("==== string conversion\n{}", str_);
 				// } else {
@@ -142,7 +142,8 @@ impl MessageManager {
 							args.push(message);
 						},
 						1 => {
-							eprintln!("wl_display delete_id unimplemented");
+							let deleted_id = decode_event_payload(&b[cursor + 8..], WireArgumentKind::UnInt)?;
+							args.push(deleted_id);
 						},
 						_ => {
 							eprintln!("unimplemented");
@@ -160,11 +161,18 @@ impl MessageManager {
 							args.push(interface);
 							args.push(version);
 						},
+						1 => {
+							let name = decode_event_payload(&b[cursor + 8..], WireArgumentKind::UnInt)?;
+							args.push(name);
+						},
 						_ => {
 							eprintln!("unimplemented");
 						},
 					}
 				},
+				3 => {
+					eprintln!("callback something");
+				}
 				_ => {
 					eprintln!("unimplemented");
 				},

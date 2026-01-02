@@ -4,17 +4,6 @@ use crate::wayland::wire::{MessageManager, WireArgument, WireMessage};
 
 pub mod wire;
 
-#[derive(PartialEq, Eq, Hash)]
-pub struct RegistryEntry {
-	interface: String,
-	version: u32,
-}
-
-pub struct Registry {
-	pub id: u32,
-	pub inner: HashMap<u32, RegistryEntry>,
-}
-
 pub struct Display {
 	pub id: u32,
 }
@@ -51,7 +40,18 @@ impl Display {
 	}
 }
 
-impl Registry {
+pub struct Registry<'a> {
+	pub id: u32,
+	pub inner: HashMap<u32, RegistryEntry<'a>>,
+}
+
+#[derive(PartialEq, Eq, Hash, Debug)]
+pub struct RegistryEntry<'a> {
+	interface: &'a str,
+	version: u32,
+}
+
+impl<'a> Registry<'a> {
 	pub fn new(id: u32) -> Self {
 		Self {
 			id,
@@ -72,12 +72,35 @@ impl Registry {
 		})
 	}
 
-	pub fn fill(&mut self, events: &Vec<WireMessage>) -> Result<(), ()> {
-		// for e in events {
-		// 	match 
-		// 	self.inner.insert(, v)
-		// }
-		todo!()
+	pub fn fill(&mut self, events: &'a Vec<WireMessage>) -> Result<(), ()> {
+		for e in events {
+			// get from idman
+			if e.sender_id != 2 {
+				continue;
+			};
+			println!("in fill ========\n{:#?}", e);
+			let name;
+			let interface;
+			let version;
+			if let WireArgument::UnInt(name_) = e.args[0] {
+				name = name_;
+			} else {
+				return Err(());
+			};
+			if let WireArgument::String(interface_) = &e.args[1] {
+				interface = interface_;
+			} else {
+				return Err(());
+			};
+			if let WireArgument::UnInt(version_) = e.args[2] {
+				version = version_;
+			} else {
+				return Err(());
+			};
+
+			self.inner.insert(name, RegistryEntry { interface, version });
+		}
+		Ok(())
 	}
 }
 

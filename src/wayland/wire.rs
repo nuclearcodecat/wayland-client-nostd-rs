@@ -1,8 +1,12 @@
 use std::{
-	env, error::Error, io::{Read, Write}, os::unix::net::UnixStream, path::PathBuf
+	env,
+	error::Error,
+	io::{Read, Write},
+	os::unix::net::UnixStream,
+	path::PathBuf,
 };
 
-use crate::wayland::WaylandError;
+use crate::wayland::{WaylandError, WaylandObjectKind};
 
 #[derive(Debug)]
 pub struct WireMessage {
@@ -43,6 +47,16 @@ pub struct MessageManager {
 	pub sock: UnixStream,
 }
 
+impl Drop for MessageManager {
+	fn drop(&mut self) {
+		println!("called drop for MessageManager");
+		let r = self.discon();
+		if r.is_err() {
+			eprintln!("failed to drop MessageManager\n{:#?}", r);
+		}
+	}
+}
+
 impl MessageManager {
 	pub fn new(sockname: &str) -> Result<Self, Box<dyn Error>> {
 		let base = env::var("XDG_RUNTIME_DIR")?;
@@ -50,9 +64,7 @@ impl MessageManager {
 		base.push(sockname);
 		let sock = UnixStream::connect(base)?;
 		sock.set_nonblocking(true)?;
-		let wlmm = Self {
-			sock,
-		};
+		let wlmm = Self { sock };
 
 		Ok(wlmm)
 	}
@@ -90,11 +102,21 @@ impl MessageManager {
 		Ok(())
 	}
 
-	pub fn get_events(&mut self) -> Result<Option<Vec<WireMessage>>, Box<dyn Error>> {
-		// reading till eof was the worst mistake of my life
-		let mut b = [0; 8192];
+	pub fn get_events_blocking(
+		&mut self,
+		id: u32,
+		kind: WaylandObjectKind,
+	) -> Result<Vec<WireMessage>, Box<dyn Error>> {
+		let mut read = self.get_events(id, &kind)?;
+		while read.is_none() {
+			read = self.get_events(id, &kind)?;
+		}
+		Ok(read.unwrap())
+	}
+
+	fn get_socket_data(&mut self, buf: &mut [u8]) -> Result<Option<usize>, Box<dyn Error>> {
 		let len;
-		match self.sock.read(&mut b) {
+		match self.sock.read(buf) {
 			Ok(l) => {
 				len = l;
 			}
@@ -108,6 +130,20 @@ impl MessageManager {
 				}
 			}
 		}
+		Ok(Some(len))
+	}
+
+	pub fn get_events(
+		&mut self,
+		obj_id: u32,
+		kind: &WaylandObjectKind,
+	) -> Result<Option<Vec<WireMessage>>, Box<dyn Error>> {
+		let mut b = [0; 8192];
+		let len = self.get_socket_data(&mut b)?;
+		if len.is_none() {
+			return Ok(None);
+		}
+		let len = len.unwrap();
 
 		let mut events = vec![];
 		let mut cursor = 0;
@@ -127,57 +163,56 @@ impl MessageManager {
 			let opcode = (byte2 & 0x0000ffff) as usize;
 
 			let mut args = vec![];
-			match sender_id {
-				// display
-				1 => match opcode {
-					0 => {
-						let obj_id = decode_event_payload(&b[cursor + 8..], WireArgumentKind::Obj)?;
-						let code =
-							decode_event_payload(&b[cursor + 12..], WireArgumentKind::UnInt)?;
-						let message =
-							decode_event_payload(&b[cursor + 16..], WireArgumentKind::String)?;
-						eprintln!(
-							"======== ERROR FIRED in wl_display \nobj_id: {:?}\ncode: {:?}\nmessage: {:?}",
-							obj_id, code, message
-						);
-						args.push(obj_id);
-						args.push(code);
-						args.push(message);
-					}
-					1 => {
-						let deleted_id =
-							decode_event_payload(&b[cursor + 8..], WireArgumentKind::UnInt)?;
-						args.push(deleted_id);
-					}
-					_ => {
-						eprintln!("unimplemented");
-					}
-				},
-				// registry
-				2 => match opcode {
-					0 => {
-						let name = decode_event_payload(&b[cursor + 8..], WireArgumentKind::UnInt)?;
-						let interface =
-							decode_event_payload(&b[cursor + 12..], WireArgumentKind::String)?;
-						let version =
-							decode_event_payload(&b[..b.len() - 4], WireArgumentKind::UnInt)?;
-						args.push(name);
-						args.push(interface);
-						args.push(version);
-					}
-					1 => {
-						let name = decode_event_payload(&b[cursor + 8..], WireArgumentKind::UnInt)?;
-						args.push(name);
-					}
-					_ => {
-						eprintln!("unimplemented");
-					}
-				},
-				3 => {
-					eprintln!("callback something");
-				}
-				_ => {
-					eprintln!("unimplemented");
+
+			if sender_id == obj_id {
+				match kind {
+					WaylandObjectKind::Display => match opcode {
+						0 => {
+							let obj_id =
+								decode_event_payload(&b[cursor + 8..], WireArgumentKind::Obj)?;
+							let code =
+								decode_event_payload(&b[cursor + 12..], WireArgumentKind::UnInt)?;
+							let message =
+								decode_event_payload(&b[cursor + 16..], WireArgumentKind::String)?;
+							eprintln!(
+								"======== ERROR FIRED in wl_display \nobj_id: {:?}\ncode: {:?}\nmessage: {:?}",
+								obj_id, code, message
+							);
+							args.push(obj_id);
+							args.push(code);
+							args.push(message);
+						}
+						1 => {
+							let deleted_id =
+								decode_event_payload(&b[cursor + 8..], WireArgumentKind::UnInt)?;
+							args.push(deleted_id);
+						}
+						_ => {
+							eprintln!("unimplemented display event");
+						}
+					},
+					WaylandObjectKind::Registry => match opcode {
+						0 => {
+							let name =
+								decode_event_payload(&b[cursor + 8..], WireArgumentKind::UnInt)?;
+							let interface =
+								decode_event_payload(&b[cursor + 12..], WireArgumentKind::String)?;
+							let version =
+								decode_event_payload(&b[..len - 4], WireArgumentKind::UnInt)?;
+							args.push(name);
+							args.push(interface);
+							args.push(version);
+						}
+						1 => {
+							let name =
+								decode_event_payload(&b[cursor + 8..], WireArgumentKind::UnInt)?;
+							args.push(name);
+						}
+						_ => {
+							eprintln!("unimplemented registry event");
+						}
+					},
+					_ => eprintln!("unimplemented interface"),
 				}
 			}
 
@@ -244,7 +279,10 @@ impl WireArgument {
 	}
 }
 
-fn decode_event_payload(payload: &[u8], kind: WireArgumentKind) -> Result<WireArgument, Box<dyn Error>> {
+fn decode_event_payload(
+	payload: &[u8],
+	kind: WireArgumentKind,
+) -> Result<WireArgument, Box<dyn Error>> {
 	let p = payload;
 	match kind {
 		WireArgumentKind::Int
@@ -265,9 +303,9 @@ fn decode_event_payload(payload: &[u8], kind: WireArgumentKind) -> Result<WireAr
 				.find(|(_, c)| **c == b'\0')
 				.map(|(e, _)| e)
 				.unwrap_or_default();
-			Ok(WireArgument::String(
-				String::from_utf8(p[4..4 + ix].to_vec())?,
-			))
+			Ok(WireArgument::String(String::from_utf8(
+				p[4..4 + ix].to_vec(),
+			)?))
 		}
 		// not sure how to handle this
 		WireArgumentKind::NewIdSpecific => {

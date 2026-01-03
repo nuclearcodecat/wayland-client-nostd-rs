@@ -1,4 +1,8 @@
-use std::{env, io::{Read, Write}, os::unix::net::UnixStream, path::PathBuf};
+use std::{
+	env, error::Error, io::{Read, Write}, os::unix::net::UnixStream, path::PathBuf
+};
+
+use crate::wayland::WaylandError;
 
 #[derive(Debug)]
 pub struct WireMessage {
@@ -41,12 +45,12 @@ pub struct MessageManager {
 }
 
 impl MessageManager {
-	pub fn new(sockname: &str) -> Result<Self, ()> {
-		let base = env::var("XDG_RUNTIME_DIR").map_err(|_| {})?; 
+	pub fn new(sockname: &str) -> Result<Self, Box<dyn Error>> {
+		let base = env::var("XDG_RUNTIME_DIR")?;
 		let mut base = PathBuf::from(base);
 		base.push(sockname);
-		let sock = UnixStream::connect(base).map_err(|_| {})?;
-		sock.set_nonblocking(true).map_err(|_| {})?;
+		let sock = UnixStream::connect(base)?;
+		sock.set_nonblocking(true)?;
 		let wlmm = Self {
 			sock,
 			last_ass_id: 1,
@@ -55,15 +59,15 @@ impl MessageManager {
 		Ok(wlmm)
 	}
 
-	pub fn discon(&self) -> Result<(), ()> {
-		self.sock.shutdown(std::net::Shutdown::Both).map_err(|_| {})
+	pub fn discon(&self) -> Result<(), Box<dyn Error>> {
+		Ok(self.sock.shutdown(std::net::Shutdown::Both)?)
 	}
 
 	fn increment_id(&mut self) {
 		self.last_ass_id += 1;
 	}
 
-	pub fn send_request(&mut self, msg: &mut WireMessage) -> Result<(), ()> {
+	pub fn send_request(&mut self, msg: &mut WireMessage) -> Result<(), Box<dyn Error>> {
 		let mut buf: Vec<u8> = vec![];
 		buf.append(&mut Vec::from(msg.sender_id.to_ne_bytes()));
 		let argsize = {
@@ -79,15 +83,20 @@ impl MessageManager {
 		buf.append(&mut Vec::from(word2.to_ne_bytes()));
 		for obj in msg.args.iter_mut() {
 			match obj {
-				WireArgument::Arr(x) => buf.append(x),
-				_ => buf.append(&mut obj.as_vec_u8())
+				WireArgument::Arr(x) => {
+					buf.append(x);
+					while x.len() % 4 > 0 {
+						buf.push(0);
+					}
+				}
+				_ => buf.append(&mut obj.as_vec_u8()),
 			}
 		}
-		self.sock.write_all(&buf).map_err(|_| {})?;
+		self.sock.write_all(&buf)?;
 		Ok(())
 	}
 
-	pub fn get_events(&mut self) -> Result<Option<Vec<WireMessage>>, ()> {
+	pub fn get_events(&mut self) -> Result<Option<Vec<WireMessage>>, Box<dyn Error>> {
 		let mut b: Vec<u8> = vec![];
 		let len;
 		match self.sock.read_to_end(&mut b) {
@@ -99,30 +108,32 @@ impl MessageManager {
 				// } else {
 				// 	eprintln!("string conversion failed");
 				// }
-			},
+			}
 			Err(er) => {
 				eprintln!("er: {:#?}", er);
 				match er.kind() {
 					std::io::ErrorKind::WouldBlock => return Ok(None),
 					_ => {
-						return Err(());
-					},
+						return Err(Box::new(er));
+					}
 				}
-			},
+			}
 		}
 
 		let mut events = vec![];
 		let mut cursor = 0;
 		let mut cursor_last = 0;
 		while cursor < len {
-			let sender_id = u32::from_ne_bytes([b[cursor], b[cursor + 1], b[cursor + 2], b[cursor + 3]]);
-			let byte2 = u32::from_ne_bytes([b[cursor + 4], b[cursor + 5], b[cursor + 6], b[cursor + 7]]);
+			let sender_id =
+				u32::from_ne_bytes([b[cursor], b[cursor + 1], b[cursor + 2], b[cursor + 3]]);
+			let byte2 =
+				u32::from_ne_bytes([b[cursor + 4], b[cursor + 5], b[cursor + 6], b[cursor + 7]]);
 
 			let recv_len = byte2 >> 16;
 			// println!("len: {}", recv_len);
 			if recv_len < 8 {
 				eprintln!("recv_len bad");
-				return Err(());
+				return Err(Box::new(WaylandError::RecvLenBad));
 			}
 			let opcode = (byte2 & 0x0000ffff) as usize;
 
@@ -130,44 +141,48 @@ impl MessageManager {
 			match sender_id {
 				// add an IdManager or smth
 				// display
-				1 => {
-					match opcode {
-						0 => {
-							let obj_id = decode_event_payload(&b[cursor + 8..], WireArgumentKind::Obj)?;
-							let code = decode_event_payload(&b[cursor + 12..], WireArgumentKind::UnInt)?;
-							let message = decode_event_payload(&b[cursor + 16..], WireArgumentKind::String)?;
-							eprintln!("======== ERROR FIRED in wl_display \nobj_id: {:?}\ncode: {:?}\nmessage: {:?}", obj_id, code, message);
-							args.push(obj_id);
-							args.push(code);
-							args.push(message);
-						},
-						1 => {
-							let deleted_id = decode_event_payload(&b[cursor + 8..], WireArgumentKind::UnInt)?;
-							args.push(deleted_id);
-						},
-						_ => {
-							eprintln!("unimplemented");
-						},
+				1 => match opcode {
+					0 => {
+						let obj_id = decode_event_payload(&b[cursor + 8..], WireArgumentKind::Obj)?;
+						let code =
+							decode_event_payload(&b[cursor + 12..], WireArgumentKind::UnInt)?;
+						let message =
+							decode_event_payload(&b[cursor + 16..], WireArgumentKind::String)?;
+						eprintln!(
+							"======== ERROR FIRED in wl_display \nobj_id: {:?}\ncode: {:?}\nmessage: {:?}",
+							obj_id, code, message
+						);
+						args.push(obj_id);
+						args.push(code);
+						args.push(message);
+					}
+					1 => {
+						let deleted_id =
+							decode_event_payload(&b[cursor + 8..], WireArgumentKind::UnInt)?;
+						args.push(deleted_id);
+					}
+					_ => {
+						eprintln!("unimplemented");
 					}
 				},
 				// registry
-				2 => {
-					match opcode {
-						0 => {
-							let name = decode_event_payload(&b[cursor + 8..], WireArgumentKind::UnInt)?;
-							let interface = decode_event_payload(&b[cursor + 12..], WireArgumentKind::String)?;
-							let version = decode_event_payload(&b[..b.len() - 4], WireArgumentKind::UnInt)?;
-							args.push(name);
-							args.push(interface);
-							args.push(version);
-						},
-						1 => {
-							let name = decode_event_payload(&b[cursor + 8..], WireArgumentKind::UnInt)?;
-							args.push(name);
-						},
-						_ => {
-							eprintln!("unimplemented");
-						},
+				2 => match opcode {
+					0 => {
+						let name = decode_event_payload(&b[cursor + 8..], WireArgumentKind::UnInt)?;
+						let interface =
+							decode_event_payload(&b[cursor + 12..], WireArgumentKind::String)?;
+						let version =
+							decode_event_payload(&b[..b.len() - 4], WireArgumentKind::UnInt)?;
+						args.push(name);
+						args.push(interface);
+						args.push(version);
+					}
+					1 => {
+						let name = decode_event_payload(&b[cursor + 8..], WireArgumentKind::UnInt)?;
+						args.push(name);
+					}
+					_ => {
+						eprintln!("unimplemented");
 					}
 				},
 				3 => {
@@ -175,7 +190,7 @@ impl MessageManager {
 				}
 				_ => {
 					eprintln!("unimplemented");
-				},
+				}
 			}
 
 			let event = WireMessage {
@@ -213,56 +228,81 @@ impl WireArgument {
 			WireArgument::Int(x) => Vec::from(x.to_ne_bytes()),
 			WireArgument::UnInt(x) => Vec::from(x.to_ne_bytes()),
 			WireArgument::FixedPrecision(x) => Vec::from(x.to_ne_bytes()),
-			WireArgument::String(x) => Vec::from(x.as_str()),
+			WireArgument::String(x) => {
+				let mut complete: Vec<u8> = vec![];
+				// str len
+				complete.append(&mut Vec::from(x.len().to_ne_bytes()));
+				complete.append(&mut Vec::from(x.as_str()));
+				// pad str
+				complete.resize(complete.len() + complete.len() % 4, 0);
+				complete
+			}
 			WireArgument::Obj(x) => Vec::from(x.to_ne_bytes()),
 			WireArgument::NewId(x) => Vec::from(x.to_ne_bytes()),
 			WireArgument::NewIdSpecific(x, y, z) => {
 				let mut complete: Vec<u8> = vec![];
+				// str len
+				complete.append(&mut Vec::from(x.len().to_ne_bytes()));
 				complete.append(&mut Vec::from(x.as_str()));
+				// pad str
+				complete.resize(complete.len() + complete.len() % 4, 0);
 				complete.append(&mut Vec::from(y.to_ne_bytes()));
 				complete.append(&mut Vec::from(z.to_ne_bytes()));
 				complete
-			},
-			WireArgument::Arr(items) => items.clone(),
+			}
+			WireArgument::Arr(_) => panic!("debil"),
 			WireArgument::FileDescriptor(x) => Vec::from(x.to_ne_bytes()),
 		}
 	}
 }
 
-fn decode_event_payload(payload: &[u8], kind: WireArgumentKind) -> Result<WireArgument, ()> {
+fn decode_event_payload(payload: &[u8], kind: WireArgumentKind) -> Result<WireArgument, Box<dyn Error>> {
 	let p = payload;
 	match kind {
-		WireArgumentKind::Int | WireArgumentKind::Obj | WireArgumentKind::NewId | WireArgumentKind::FileDescriptor | WireArgumentKind::FixedPrecision => {
-			Ok(WireArgument::Int(i32::from_ne_bytes([p[0], p[1], p[2], p[3]])))
-		},
-		WireArgumentKind::UnInt => {
-			Ok(WireArgument::UnInt(u32::from_ne_bytes([p[0], p[1], p[2], p[3]])))
-		},
+		WireArgumentKind::Int
+		| WireArgumentKind::Obj
+		| WireArgumentKind::NewId
+		| WireArgumentKind::FileDescriptor
+		| WireArgumentKind::FixedPrecision => Ok(WireArgument::Int(i32::from_ne_bytes([
+			p[0], p[1], p[2], p[3],
+		]))),
+		WireArgumentKind::UnInt => Ok(WireArgument::UnInt(u32::from_ne_bytes([
+			p[0], p[1], p[2], p[3],
+		]))),
 		WireArgumentKind::String => {
 			let len = u32::from_ne_bytes([p[0], p[1], p[2], p[3]]) as usize;
-			let ix = p[4..4+len].iter().enumerate().find(|(_, c)| **c == b'\0').map(|(e, _)| e).unwrap_or_default();
-			Ok(WireArgument::String(String::from_utf8(p[4..4+ix].to_vec()).map_err(|_| {})?))
-		},
+			let ix = p[4..4 + len]
+				.iter()
+				.enumerate()
+				.find(|(_, c)| **c == b'\0')
+				.map(|(e, _)| e)
+				.unwrap_or_default();
+			Ok(WireArgument::String(
+				String::from_utf8(p[4..4 + ix].to_vec())?,
+			))
+		}
 		// not sure how to handle this
 		WireArgumentKind::NewIdSpecific => {
-			let nulterm = p.iter().enumerate().find(|(_, c)| **c == b'\0').map(|(e, _)| e);
-			if let Some(pos) = nulterm {
-				let slice = &p[0..pos];
-				let str_ = str::from_utf8(slice).map_err(|_| {})?;
-				let version = u32::from_ne_bytes([p[pos], p[pos + 1], p[pos + 2], p[pos + 3]]);
-				let new_id = u32::from_ne_bytes([p[pos + 4], p[pos + 5], p[pos + 6], p[pos + 7]]);
-				Ok(WireArgument::NewIdSpecific(
-					str_.to_string(), 
-					version,
-					new_id
-				))
-			} else {
-				Err(())
-			}
-		},
-		WireArgumentKind::Arr => {
-			Ok(WireArgument::Arr(payload.to_vec()))
-		},
+			// let nulterm = p
+			// 	.iter()
+			// 	.enumerate()
+			// 	.find(|(_, c)| **c == b'\0')
+			// 	.map(|(e, _)| e);
+			// if let Some(pos) = nulterm {
+			// 	let slice = &p[0..pos];
+			// 	let str_ = str::from_utf8(slice)?;
+			// 	let version = u32::from_ne_bytes([p[pos], p[pos + 1], p[pos + 2], p[pos + 3]]);
+			// 	let new_id = u32::from_ne_bytes([p[pos + 4], p[pos + 5], p[pos + 6], p[pos + 7]]);
+			// 	Ok(WireArgument::NewIdSpecific(
+			// 		str_.to_string(),
+			// 		version,
+			// 		new_id,
+			// 	))
+			// } else {
+			// 	Err(())
+			// }
+			todo!()
+		}
+		WireArgumentKind::Arr => Ok(WireArgument::Arr(payload.to_vec())),
 	}
 }
-

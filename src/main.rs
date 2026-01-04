@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+#![feature(unix_socket_ancillary_data)]
 
 use std::{env, error::Error, time::Duration};
 
@@ -18,13 +19,13 @@ fn main() -> Result<(), Box<dyn Error>> {
 	let compositor = Compositor::new_bound(&mut registry, &mut wlmm, &mut wlim)?;
 	let mut shm = SharedMemory::new_bound(&mut registry, &mut wlmm, &mut wlim)?;
 	let mut shm_pool = SharedMemoryPool::new_bound(&mut shm, 500 * 500 * 4, &mut wlmm, &mut wlim)?;
-	// let buf = Buffer::new_initialized(&mut shm_pool, (0, 500, 500, 500), wayland::PixelFormat::Xrgb888, &mut wlmm, &mut wlim)?;
+	let buf = Buffer::new_initialized(&mut shm_pool, (0, 500, 500, 500), wayland::PixelFormat::Xrgb888, &mut wlmm, &mut wlim)?;
 
 	std::thread::sleep(Duration::from_millis(100));
 	// errors should fire anyway but i need to specify something
 	wlmm.get_events_blocking(0, wayland::WaylandObjectKind::Display)?;
 
 	// USE INTERMUT SO SHIT DROPS WHEN PANICKING
-	// shm_pool.destroy(&mut wlmm, &mut wlim)?;
+	shm_pool.destroy(&mut wlmm, &mut wlim)?;
 	Ok(())
 }

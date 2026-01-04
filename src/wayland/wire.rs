@@ -1,8 +1,8 @@
 use std::{
 	env,
 	error::Error,
-	io::{Read, Write},
-	os::unix::net::UnixStream,
+	io::{IoSlice, Read, Write},
+	os::{fd::RawFd, unix::net::{SocketAncillary, UnixStream}},
 	path::PathBuf,
 };
 
@@ -27,7 +27,7 @@ pub enum WireArgument {
 	NewIdSpecific(&'static str, u32, u32),
 	Arr(Vec<u8>),
 	// u32?
-	FileDescriptor(i32),
+	FileDescriptor(RawFd),
 }
 
 #[derive(Debug)]
@@ -78,6 +78,7 @@ impl MessageManager {
 		let mut buf: Vec<u8> = vec![];
 		buf.append(&mut Vec::from(msg.sender_id.to_ne_bytes()));
 		buf.append(&mut vec![0, 0, 0, 0]);
+		let mut fds = vec![];
 		for obj in msg.args.iter_mut() {
 			match obj {
 				WireArgument::Arr(x) => {
@@ -87,8 +88,7 @@ impl MessageManager {
 					buf.resize(x.len() - (x.len() % 4) - 4, 0);
 				},
 				WireArgument::FileDescriptor(x) => {
-					// send in control
-					todo!()
+					fds.push(*x as RawFd);
 				},
 				_ => buf.append(&mut obj.as_vec_u8()),
 			}
@@ -98,9 +98,13 @@ impl MessageManager {
 		let word2 = word2.to_ne_bytes();
 		for (en, ix) in (4..=7).enumerate() {
 			buf[ix] = word2[en];
-		}
-		self.sock.write_all(&buf)?;
-		println!("=== REQUEST SENT\n{:#?}\n{:?}\nbuf len: {}\n\n", msg, buf, buf.len());
+		};
+		let mut ancillary_buf = [0; 128];
+		let mut ancillary = SocketAncillary::new(&mut ancillary_buf);
+		ancillary.add_fds(&fds);
+		self.sock.send_vectored_with_ancillary(&[IoSlice::new(&buf)], &mut ancillary)?;
+		// self.sock.write_all(&buf)?;
+		println!("=== REQUEST SENT\n{:#?}\n{:?}\nbuf len: {}\naux: {:?}\n\n", msg, buf, buf.len(), ancillary);
 		Ok(())
 	}
 

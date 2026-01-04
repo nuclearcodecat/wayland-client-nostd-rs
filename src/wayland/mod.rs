@@ -2,7 +2,7 @@ use std::{collections::HashMap, error::Error, ffi::CString, fmt};
 
 // std depends on libc anyway so i consider using it fair
 // i may replace this with asm in the future but that means amd64 only
-use libc::{O_CREAT, O_RDWR, shm_open, shm_unlink};
+use libc::{O_CREAT, O_RDWR, ftruncate, shm_open, shm_unlink};
 
 use crate::wayland::wire::{MessageManager, WireArgument, WireMessage};
 
@@ -204,13 +204,14 @@ impl SharedMemory {
 	) -> Result<(u32, i32), Box<dyn Error>> {
 		let fd = unsafe { shm_open(name.as_ptr(), O_RDWR | O_CREAT, 0) };
 		println!("fd: {}", fd);
+		unsafe { ftruncate(fd, size.into()) };
 
 		let id = wlim.new_id();
 		wlmm.send_request(&mut WireMessage {
 			sender_id: self.id,
 			opcode: 0,
 			args: vec![
-				WireArgument::NewId(id),
+				WireArgument::NewIdSpecific(WaylandObjectKind::SharedMemoryPool.as_str(), 2, id),
 				WireArgument::FileDescriptor(fd),
 				WireArgument::Int(size),
 			],

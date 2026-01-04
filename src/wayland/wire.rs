@@ -77,31 +77,30 @@ impl MessageManager {
 		println!("==== SEND_REQUEST CALLED");
 		let mut buf: Vec<u8> = vec![];
 		buf.append(&mut Vec::from(msg.sender_id.to_ne_bytes()));
-		let len = {
-			// header is 8
-			let mut complete = 8;
-			for n in msg.args.iter() {
-				let size = n.size();
-				complete += size;
-			}
-			complete
-		};
-		let word2 = (len << 16) as u32 | (msg.opcode as u32 & 0x0000ffffu32);
-		println!("=== WORD2\n0b{:0b}\nlen: {}\nopcode: {}", word2, word2 >> 16, word2 & 0x0000ffff);
-		buf.append(&mut Vec::from(word2.to_ne_bytes()));
+		buf.append(&mut vec![0, 0, 0, 0]);
 		for obj in msg.args.iter_mut() {
 			match obj {
 				WireArgument::Arr(x) => {
+					let len = x.len() as u32;
+					buf.append(&mut Vec::from(len.to_ne_bytes()));
 					buf.append(x);
-					while x.len() % 4 > 0 {
-						buf.push(0);
-					}
-				}
+					buf.resize(x.len() - (x.len() % 4) - 4, 0);
+				},
+				WireArgument::FileDescriptor(x) => {
+					// send in control
+					todo!()
+				},
 				_ => buf.append(&mut obj.as_vec_u8()),
 			}
 		}
+		let word2 = (buf.len() << 16) as u32 | (msg.opcode as u32 & 0x0000ffffu32);
+		println!("=== WORD2\n0b{:0b}\nlen: {}\nopcode: {}", word2, word2 >> 16, word2 & 0x0000ffff);
+		let word2 = word2.to_ne_bytes();
+		for (en, ix) in (4..=7).enumerate() {
+			buf[ix] = word2[en];
+		}
 		self.sock.write_all(&buf)?;
-		println!("=== REQUEST SENT\n{:#?}\n{:?}\n\n", msg, buf);
+		println!("=== REQUEST SENT\n{:#?}\n{:?}\nbuf len: {}\n\n", msg, buf, buf.len());
 		Ok(())
 	}
 
@@ -112,7 +111,7 @@ impl MessageManager {
 	) -> Result<Vec<WireMessage>, Box<dyn Error>> {
 		let mut read = self.get_events(id, &kind)?;
 		let mut retries = 0;
-		while read.is_none() && retries <= 30 {
+		while read.is_none() && retries <= 1000 {
 			read = self.get_events(id, &kind)?;
 			retries += 1;
 		}
@@ -255,26 +254,39 @@ impl WireArgument {
 			WireArgument::FixedPrecision(x) => Vec::from(x.to_ne_bytes()),
 			WireArgument::String(x) => {
 				let mut complete: Vec<u8> = vec![];
-				// str len
-				complete.append(&mut Vec::from(x.len().to_ne_bytes()));
+				// str len + 1 because of nul
+				let len = &mut Vec::from(((x.len() + 1) as u32).to_ne_bytes());
+				complete.append(len);
 				complete.append(&mut Vec::from(x.as_str()));
-				// pad str
-				complete.resize(complete.len() + complete.len() % 4, 0);
+				// nul
+				complete.push(0);
+				// padding
+				complete.resize(complete.len() - (complete.len() % 4) + 4, 0);
+				// println!("complete len rn: {}", complete.len());
 				complete
-			}
+			},
 			WireArgument::Obj(x) => Vec::from(x.to_ne_bytes()),
 			WireArgument::NewId(x) => Vec::from(x.to_ne_bytes()),
 			WireArgument::NewIdSpecific(x, y, z) => {
 				let mut complete: Vec<u8> = vec![];
 				// str len
-				complete.append(&mut Vec::from(x.len().to_ne_bytes()));
+				let len = &mut Vec::from(((x.len() + 1) as u32).to_ne_bytes());
+				complete.append(len);
+				// println!("len: {}, complete: {:?}", complete.len(), complete);
 				complete.append(&mut Vec::from(*x));
+				// println!("len: {}, complete: {:?}", complete.len(), complete);
+				complete.push(0);
+				// println!("len: {}, complete: {:?}", complete.len(), complete);
 				// pad str
-				complete.resize(complete.len() + complete.len() % 4, 0);
+				complete.resize(complete.len() - (complete.len() % 4) + 4, 0);
+				// println!("len: {}, complete: {:?}", complete.len(), complete);
 				complete.append(&mut Vec::from(y.to_ne_bytes()));
+				// println!("len: {}, complete: {:?}", complete.len(), complete);
 				complete.append(&mut Vec::from(z.to_ne_bytes()));
+				// println!("len: {}, complete: {:?}", complete.len(), complete);
+				// println!("complete len rn: {}", complete.len());
 				complete
-			}
+			},
 			WireArgument::Arr(_) => panic!("debil"),
 			WireArgument::FileDescriptor(x) => Vec::from(x.to_ne_bytes()),
 		}

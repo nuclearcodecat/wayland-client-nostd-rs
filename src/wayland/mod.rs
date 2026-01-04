@@ -211,7 +211,8 @@ impl SharedMemory {
 			sender_id: self.id,
 			opcode: 0,
 			args: vec![
-				WireArgument::NewIdSpecific(WaylandObjectKind::SharedMemoryPool.as_str(), 2, id),
+				WireArgument::NewIdSpecific(WaylandObjectKind::SharedMemoryPool.as_str(), 1, id),
+				// WireArgument::NewId(id),
 				WireArgument::FileDescriptor(fd),
 				WireArgument::Int(size),
 			],

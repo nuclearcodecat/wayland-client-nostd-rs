@@ -709,7 +709,7 @@ impl XdgSurface {
 		wlmm: &mut MessageManager,
 		wlim: &mut IdentManager,
 	) -> Result<u32, Box<dyn Error>> {
-		let xdg_toplevel_id = wlim.new_id_registered(WaylandObjectKind::XdgSurface);
+		let xdg_toplevel_id = wlim.new_id_registered(WaylandObjectKind::XdgTopLevel);
 		wlmm.send_request(&mut WireRequest {
 			sender_id: self.id,
 			opcode: 1,

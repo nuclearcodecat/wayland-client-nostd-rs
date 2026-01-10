@@ -10,7 +10,7 @@ use std::{
 	path::PathBuf,
 };
 
-use crate::wayland::{IdentManager, WaylandError, WaylandObjectKind};
+use crate::wayland::WaylandError;
 
 pub type Id = u32;
 
@@ -249,7 +249,7 @@ impl WireArgument {
 	}
 }
 
-fn decode_event_payload(
+pub fn decode_event_payload(
 	payload: &[u8],
 	kind: WireArgumentKind,
 ) -> Result<WireArgument, Box<dyn Error>> {

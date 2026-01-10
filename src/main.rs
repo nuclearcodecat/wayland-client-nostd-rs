@@ -1,12 +1,7 @@
-#![allow(dead_code)]
-#![feature(unix_socket_ancillary_data)]
-
 use std::{cell::RefCell, env, error::Error, rc::Rc};
 
-mod wayland;
-
 use crate::wayland::{
-	Compositor, Context, Display, IdentManager, Registry, SharedMemory, XdgWmBase, wire::{MessageManager, WireArgument}
+	compositor::Compositor, Context, display::Display, IdentManager, registry::Registry, shm::SharedMemory, XdgWmBase, wire::{MessageManager, WireArgument}
 };
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -24,7 +19,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 	let mut shm_pool = shm.make_pool(500 * 500 * 4)?;
 	let buf = shm_pool.make_buffer(
 		(0, 500, 500, 500),
-		wayland::PixelFormat::Xrgb888,
+		wayland::shm::PixelFormat::Xrgb888,
 	)?;
 	let xdg_wm_base = XdgWmBase::new_bound(&mut display, &mut registry, ctx.clone())?;
 	let xdg_surface = xdg_wm_base.make_xdg_surface(surface.id)?;

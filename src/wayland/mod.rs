@@ -1,41 +1,54 @@
 use std::{
-	collections::{HashMap, HashSet},
-	error::Error,
-	ffi::CString,
-	fmt,
+	cell::RefCell, collections::{HashMap, HashSet}, error::Error, ffi::CString, fmt, os::fd::RawFd, rc::Rc
 };
 
 // std depends on libc anyway so i consider using it fair
 // i may replace this with asm in the future but that means amd64 only
 use libc::{O_CREAT, O_RDWR, ftruncate, shm_open, shm_unlink};
 
-use crate::wayland::wire::{MessageManager, WireArgument, WireEvent, WireRequest};
+use crate::wayland::wire::{MessageManager, WireArgument, WireEventRaw, WireRequest, Id};
 
 pub mod wire;
 
+pub type CtxType = Rc<RefCell<Context>>;
+
+#[derive(Debug)]
+pub struct Context {
+	wlmm: MessageManager,
+	wlim: IdentManager,
+}
+
+impl Context {
+	pub fn new(wlmm: MessageManager, wlim: IdentManager) -> Self {
+		Self {
+			wlmm,
+			wlim,
+		}
+	}
+}
+
 pub struct Display {
-	pub id: u32,
+	pub id: Id,
+	ctx: CtxType,
 }
 
 impl Display {
-	pub fn new(wlim: &mut IdentManager) -> Self {
+	pub fn new(ctx: CtxType) -> Self {
+		let id = ctx.borrow_mut().wlim.new_id_registered(WaylandObjectKind::Display);
 		Self {
-			id: wlim.new_id_registered(WaylandObjectKind::Display),
+			id,
+			ctx,
 		}
 	}
 
 	fn wl_get_registry(
 		&mut self,
-		wlmm: &mut MessageManager,
-		wlim: &mut IdentManager,
 	) -> Result<u32, Box<dyn Error>> {
-		let id = wlim.new_id_registered(WaylandObjectKind::Registry);
-		wlmm.send_request(&mut WireRequest {
+		let id = self.ctx.borrow_mut().wlim.new_id_registered(WaylandObjectKind::Registry);
+		self.ctx.borrow().wlmm.send_request(&mut WireRequest {
 			sender_id: self.id,
-			// second request in the proto
 			opcode: 1,
 			args: vec![
-				// wl_registry id is now 2 since 1 is the display
 				WireArgument::NewId(id),
 			],
 		})?;
@@ -44,11 +57,9 @@ impl Display {
 
 	pub fn wl_sync(
 		&mut self,
-		wlmm: &mut MessageManager,
-		wlim: &mut IdentManager,
 	) -> Result<u32, Box<dyn Error>> {
-		let cb_id = wlim.new_id_registered(WaylandObjectKind::Callback);
-		wlmm.send_request(&mut WireRequest {
+		let cb_id = self.ctx.borrow_mut().wlim.new_id_registered(WaylandObjectKind::Callback);
+		self.ctx.borrow().wlmm.send_request(&mut WireRequest {
 			sender_id: self.id,
 			opcode: 0,
 			args: vec![WireArgument::NewId(cb_id)],
@@ -58,8 +69,9 @@ impl Display {
 }
 
 pub struct Registry {
-	id: u32,
+	id: Id,
 	inner: HashMap<u32, RegistryEntry>,
+	ctx: CtxType,
 }
 
 #[derive(PartialEq, Eq, Hash, Debug)]
@@ -69,48 +81,47 @@ pub struct RegistryEntry {
 }
 
 impl Registry {
-	pub fn new_empty(id: u32) -> Self {
+	pub fn new_empty(id: Id, ctx: CtxType) -> Self {
 		Self {
 			id,
 			inner: HashMap::new(),
+			ctx,
 		}
 	}
 
 	pub fn new_filled(
 		display: &mut Display,
-		wlmm: &mut MessageManager,
-		wlim: &mut IdentManager,
+		ctx: CtxType,
 	) -> Result<Self, Box<dyn Error>> {
-		let reg_id = display.wl_get_registry(wlmm, wlim)?;
-		let mut registry = Self::new_empty(reg_id);
-		let cbid = display.wl_sync(wlmm, wlim)?;
+		let reg_id = display.wl_get_registry()?;
+		let cbid = display.wl_sync()?;
 
 		let mut events = vec![];
 		let mut done = false;
 		while !done {
-			wlmm.get_events(wlim)?;
+			ctx.borrow_mut().wlmm.get_events()?;
 
-			while let Some(msg) = wlmm.q.pop_front() {
+			while let Some(msg) = ctx.borrow_mut().wlmm.q.pop_front() {
 				if msg.recv_id == cbid {
 					println!("registry callback done");
 					done = true;
 					break;
-				} else if msg.recv_id == registry.id {
+				} else if msg.recv_id == reg_id {
 					events.push(msg);
 				}
 			}
 		}
 
+		let mut registry = Self::new_empty(reg_id, ctx);
 		registry.fill(&events)?;
 		Ok(registry)
 	}
 
 	fn wl_bind(
 		&mut self,
-		id: u32,
+		id: Id,
 		object: WaylandObjectKind,
 		version: u32,
-		wlmm: &mut MessageManager,
 	) -> Result<(), Box<dyn Error>> {
 		let global_id = self
 			.inner
@@ -121,7 +132,7 @@ impl Registry {
 			.ok_or(WaylandError::NotInRegistry)?;
 		println!("bind global id for {}: {}", object.as_str(), global_id);
 
-		wlmm.send_request(&mut WireRequest {
+		self.ctx.borrow().wlmm.send_request(&mut WireRequest {
 			// wl_registry id
 			sender_id: self.id,
 			// first request in the proto
@@ -135,7 +146,7 @@ impl Registry {
 		Ok(())
 	}
 
-	pub fn fill(&mut self, events: &[WireEvent]) -> Result<(), Box<dyn Error>> {
+	pub fn fill(&mut self, events: &[WireEventRaw]) -> Result<(), Box<dyn Error>> {
 		for e in events {
 			if e.recv_id != self.id {
 				continue;
@@ -176,32 +187,32 @@ impl Registry {
 }
 
 pub struct Compositor {
-	pub id: u32,
+	pub id: Id,
+	ctx: CtxType,
 }
 
 impl Compositor {
-	pub fn new(id: u32) -> Self {
+	pub fn new(id: Id, ctx: CtxType) -> Self {
 		Self {
 			id,
+			ctx,
 		}
 	}
 
 	pub fn new_bound(
 		registry: &mut Registry,
-		wlmm: &mut MessageManager,
-		wlim: &mut IdentManager,
+		ctx: CtxType,
 	) -> Result<Self, Box<dyn Error>> {
-		let id = wlim.new_id_registered(WaylandObjectKind::Compositor);
-		registry.wl_bind(id, WaylandObjectKind::Compositor, 5, wlmm)?;
-		Ok(Self::new(id))
+		let id = ctx.borrow_mut().wlim.new_id_registered(WaylandObjectKind::Compositor);
+		registry.wl_bind(id, WaylandObjectKind::Compositor, 5)?;
+		Ok(Self::new(id, ctx))
 	}
 
 	fn wl_create_surface(
 		&self,
-		id: u32,
-		wlmm: &mut MessageManager,
+		id: Id,
 	) -> Result<(), Box<dyn Error>> {
-		wlmm.send_request(&mut WireRequest {
+		self.ctx.borrow().wlmm.send_request(&mut WireRequest {
 			sender_id: self.id,
 			opcode: 0,
 			args: vec![WireArgument::UnInt(id)],
@@ -210,26 +221,27 @@ impl Compositor {
 
 	pub fn make_surface(
 		&self,
-		wlmm: &mut MessageManager,
-		wlim: &mut IdentManager,
 	) -> Result<Surface, Box<dyn Error>> {
-		let id = wlim.new_id_registered(WaylandObjectKind::Surface);
-		self.wl_create_surface(id, wlmm)?;
+		let id = self.ctx.borrow_mut().wlim.new_id_registered(WaylandObjectKind::Surface);
+		self.wl_create_surface(id)?;
+		let ctx = self.ctx.clone();
 		Ok(Surface {
 			id,
+			ctx,
 			attached_buf: None,
 		})
 	}
 }
 
 pub struct Surface {
-	pub id: u32,
+	pub id: Id,
+	ctx: CtxType,
 	attached_buf: Option<u32>,
 }
 
 impl Surface {
-	fn wl_destroy(&self, wlmm: &mut MessageManager) -> Result<(), Box<dyn Error>> {
-		wlmm.send_request(&mut WireRequest {
+	fn wl_destroy(&self) -> Result<(), Box<dyn Error>> {
+		self.ctx.borrow().wlmm.send_request(&mut WireRequest {
 			sender_id: self.id,
 			opcode: 0,
 			args: vec![],
@@ -238,16 +250,14 @@ impl Surface {
 
 	pub fn destroy(
 		&self,
-		wlmm: &mut MessageManager,
-		wlim: &mut IdentManager,
 	) -> Result<(), Box<dyn Error>> {
-		self.wl_destroy(wlmm)?;
-		wlim.free_id(self.id)?;
+		self.wl_destroy()?;
+		self.ctx.borrow_mut().wlim.free_id(self.id)?;
 		Ok(())
 	}
 
-	fn wl_attach(&self, buf_id: u32, wlmm: &mut MessageManager) -> Result<(), Box<dyn Error>> {
-		wlmm.send_request(&mut WireRequest {
+	fn wl_attach(&self, buf_id: Id) -> Result<(), Box<dyn Error>> {
+		self.ctx.borrow().wlmm.send_request(&mut WireRequest {
 			sender_id: self.id,
 			opcode: 1,
 			args: vec![
@@ -261,41 +271,40 @@ impl Surface {
 	pub fn attach_buffer(
 		&mut self,
 		to_att: u32,
-		wlmm: &mut MessageManager,
 	) -> Result<(), Box<dyn Error>> {
 		self.attached_buf = Some(to_att);
-		self.wl_attach(to_att, wlmm)
+		self.wl_attach(to_att)
 	}
 
 	fn wl_commit(
 		&self,
-		wlmm: &mut MessageManager
 	) -> Result<(), Box<dyn Error>> {
-		wlmm.send_request(&mut WireRequest {
+		self.ctx.borrow().wlmm.send_request(&mut WireRequest {
 			sender_id: self.id,
 			opcode: 6,
 			args: vec![],
 		})
 	}
 
-	pub fn commmit(
+	pub fn commit(
 		&self,
-		wlmm: &mut MessageManager
 	) -> Result<(), Box<dyn Error>> {
-		self.wl_commit(wlmm)
+		self.wl_commit()
 	}
 }
 
 #[derive(Debug)]
 pub struct SharedMemory {
-	id: u32,
+	id: Id,
+	ctx: CtxType,
 	valid_pix_formats: HashSet<PixelFormat>,
 }
 
 impl SharedMemory {
-	pub fn new(id: u32) -> Self {
+	pub fn new(id: Id, ctx: CtxType) -> Self {
 		Self {
 			id,
+			ctx,
 			valid_pix_formats: HashSet::new(),
 		}
 	}
@@ -307,18 +316,17 @@ impl SharedMemory {
 	pub fn new_bound_initialized(
 		display: &mut Display,
 		registry: &mut Registry,
-		wlmm: &mut MessageManager,
-		wlim: &mut IdentManager,
+		ctx: CtxType,
 	) -> Result<Self, Box<dyn Error>> {
-		let id = wlim.new_id_registered(WaylandObjectKind::SharedMemory);
-		registry.wl_bind(id, WaylandObjectKind::SharedMemory, 1, wlmm)?;
-		let mut shm = Self::new(id);
+		let id = ctx.borrow_mut().wlim.new_id_registered(WaylandObjectKind::SharedMemory);
+		registry.wl_bind(id, WaylandObjectKind::SharedMemory, 1)?;
+		let mut shm = Self::new(id, ctx);
 
-		let cbid = display.wl_sync(wlmm, wlim)?;
-		wlmm.get_events(wlim)?;
+		let cbid = display.wl_sync()?;
+		ctx.borrow_mut().wlmm.get_events()?;
 		let mut done = false;
 		while !done {
-			while let Some(msg) = wlmm.q.pop_front() {
+			while let Some(msg) = ctx.borrow_mut().wlmm.q.pop_front() {
 				if msg.recv_id == id {
 					for arg in msg.args {
 						if let WireArgument::UnInt(x) = arg {
@@ -340,19 +348,25 @@ impl SharedMemory {
 		Ok(shm)
 	}
 
+	pub fn make_pool(
+		&self,
+		size: i32,
+	) -> Result<SharedMemoryPool, Box<dyn Error>> { let name = CString::new("wl-shm-1")?;
+		let (id, fd) = self.wl_create_pool(&name, size)?;
+		Ok(SharedMemoryPool::new(id, self.ctx.clone(), name, size, fd))
+	}
+
 	fn wl_create_pool(
 		&self,
 		name: &CString,
 		size: i32,
-		wlmm: &mut MessageManager,
-		wlim: &mut IdentManager,
-	) -> Result<(u32, i32), Box<dyn Error>> {
+	) -> Result<(Id, RawFd), Box<dyn Error>> {
 		let fd = unsafe { shm_open(name.as_ptr(), O_RDWR | O_CREAT, 0) };
 		println!("fd: {}", fd);
 		unsafe { ftruncate(fd, size.into()) };
 
-		let id = wlim.new_id_registered(WaylandObjectKind::SharedMemoryPool);
-		wlmm.send_request(&mut WireRequest {
+		let id = self.ctx.borrow_mut().wlim.new_id_registered(WaylandObjectKind::SharedMemoryPool);
+		self.ctx.borrow().wlmm.send_request(&mut WireRequest {
 			sender_id: self.id,
 			opcode: 0,
 			args: vec![
@@ -367,42 +381,31 @@ impl SharedMemory {
 }
 
 pub struct SharedMemoryPool {
-	id: u32,
+	id: Id,
+	ctx: CtxType,
 	name: CString,
 	size: i32,
-	fd: i32,
+	fd: RawFd,
 }
 
 impl SharedMemoryPool {
-	pub fn new(id: u32, name: CString, size: i32, fd: i32) -> Self {
+	pub fn new(id: Id, ctx: CtxType, name: CString, size: i32, fd: RawFd) -> Self {
 		Self {
 			id,
+			ctx,
 			name,
 			size,
 			fd,
 		}
 	}
 
-	pub fn new_initialized(
-		shm: &mut SharedMemory,
-		size: i32,
-		wlmm: &mut MessageManager,
-		wlim: &mut IdentManager,
-	) -> Result<Self, Box<dyn Error>> {
-		let name = CString::new("wl-shm-1")?;
-		let (id, fd) = shm.wl_create_pool(&name, size, wlmm, wlim)?;
-		Ok(Self::new(id, name, size, fd))
-	}
-
 	fn wl_create_buffer(
 		&self,
 		(offset, width, height, stride): (i32, i32, i32, i32),
 		format: PixelFormat,
-		wlmm: &mut MessageManager,
-		wlim: &mut IdentManager,
 	) -> Result<u32, Box<dyn Error>> {
-		let id = wlim.new_id_registered(WaylandObjectKind::Buffer);
-		wlmm.send_request(&mut WireRequest {
+		let id = self.ctx.borrow_mut().wlim.new_id_registered(WaylandObjectKind::Buffer);
+		self.ctx.borrow().wlmm.send_request(&mut WireRequest {
 			sender_id: self.id,
 			opcode: 0,
 			args: vec![
@@ -417,8 +420,25 @@ impl SharedMemoryPool {
 		Ok(id)
 	}
 
-	fn wl_destroy(&self, wlmm: &mut MessageManager) -> Result<(), Box<dyn Error>> {
-		wlmm.send_request(&mut WireRequest {
+	pub fn make_buffer(
+		&self,
+		(offset, width, height, stride): (i32, i32, i32, i32),
+		format: PixelFormat,
+	) -> Result<Buffer, Box<dyn Error>> {
+		let id = self.wl_create_buffer((offset, width, height, stride), format)?;
+		Ok(Buffer {
+			id,
+			ctx: self.ctx.clone(),
+			offset,
+			width,
+			height,
+			stride,
+			format,
+		})
+	}
+
+	fn wl_destroy(&self) -> Result<(), Box<dyn Error>> {
+		self.ctx.borrow().wlmm.send_request(&mut WireRequest {
 			sender_id: self.id,
 			opcode: 1,
 			args: vec![],
@@ -436,17 +456,16 @@ impl SharedMemoryPool {
 
 	pub fn destroy(
 		&self,
-		wlmm: &mut MessageManager,
-		wlim: &mut IdentManager,
 	) -> Result<(), Box<dyn Error>> {
-		self.wl_destroy(wlmm)?;
-		wlim.free_id(self.id)?;
+		self.wl_destroy()?;
+		self.ctx.borrow_mut().wlim.free_id(self.id)?;
 		Ok(self.unlink()?)
 	}
 }
 
 pub struct Buffer {
-	pub id: u32,
+	pub id: Id,
+	ctx: CtxType,
 	pub offset: i32,
 	pub width: i32,
 	pub height: i32,
@@ -455,26 +474,8 @@ pub struct Buffer {
 }
 
 impl Buffer {
-	pub fn new_initialized(
-		shm_pool: &mut SharedMemoryPool,
-		(offset, width, height, stride): (i32, i32, i32, i32),
-		format: PixelFormat,
-		wlmm: &mut MessageManager,
-		wlim: &mut IdentManager,
-	) -> Result<Self, Box<dyn Error>> {
-		let id = shm_pool.wl_create_buffer((offset, width, height, stride), format, wlmm, wlim)?;
-		Ok(Self {
-			id,
-			offset,
-			width,
-			height,
-			stride,
-			format,
-		})
-	}
-
-	fn wl_destroy(&self, wlmm: &mut MessageManager) -> Result<(), Box<dyn Error>> {
-		wlmm.send_request(&mut WireRequest {
+	fn wl_destroy(&self) -> Result<(), Box<dyn Error>> {
+		self.ctx.borrow().wlmm.send_request(&mut WireRequest {
 			sender_id: self.id,
 			opcode: 0,
 			args: vec![],
@@ -483,11 +484,9 @@ impl Buffer {
 
 	pub fn destroy(
 		&self,
-		wlmm: &mut MessageManager,
-		wlim: &mut IdentManager,
 	) -> Result<(), Box<dyn Error>> {
-		self.wl_destroy(wlmm)?;
-		wlim.free_id(self.id)?;
+		self.wl_destroy()?;
+		self.ctx.borrow_mut().wlim.free_id(self.id)?;
 		Ok(())
 	}
 }
@@ -525,27 +524,27 @@ impl WaylandObjectKind {
 	}
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct IdentManager {
-	top_id: u32,
-	free: Vec<u32>,
-	idmap: HashMap<u32, WaylandObjectKind>,
+	top_id: Id,
+	free: Vec<Id>,
+	idmap: HashMap<Id, WaylandObjectKind>,
 }
 
 impl IdentManager {
-	fn new_id(&mut self) -> u32 {
+	fn new_id(&mut self) -> Id {
 		self.top_id += 1;
 		println!("! idman ! new id picked: {}", self.top_id);
 		self.top_id
 	}
 
-	fn new_id_registered(&mut self, kind: WaylandObjectKind) -> u32 {
+	fn new_id_registered(&mut self, kind: WaylandObjectKind) -> Id {
 		let id = self.new_id();
 		self.idmap.insert(id, kind);
 		id
 	}
 
-	fn free_id(&mut self, id: u32) -> Result<(), Box<dyn Error>> {
+	fn free_id(&mut self, id: Id) -> Result<(), Box<dyn Error>> {
 		let registered = self.idmap.iter().find(|(k, _)| **k == id).map(|(k, _)| k).copied();
 		if let Some(r) = registered {
 			self.idmap.remove(&r).ok_or(WaylandError::IdMapRemovalFail.boxed())?;
@@ -555,7 +554,7 @@ impl IdentManager {
 	}
 
 	// ugh
-	pub fn find_obj_by_id(&self, id: u32) -> Option<&WaylandObjectKind> {
+	pub fn find_obj_by_id(&self, id: Id) -> Option<&WaylandObjectKind> {
 		self.idmap.iter().find(|(k, _)| **k == id).map(|(_, v)| v)
 	}
 }
@@ -613,25 +612,25 @@ impl PixelFormat {
 }
 
 pub struct XdgWmBase {
-	pub id: u32,
+	pub id: Id,
+	ctx: CtxType,
 }
 
 impl XdgWmBase {
 	pub fn new_bound(
 		display: &mut Display,
 		registry: &mut Registry,
-		wlmm: &mut MessageManager,
-		wlim: &mut IdentManager,
+		ctx: CtxType,
 	) -> Result<Self, Box<dyn Error>> {
-		let id = wlim.new_id_registered(WaylandObjectKind::XdgWmBase);
-		registry.wl_bind(id, WaylandObjectKind::XdgWmBase, 1, wlmm)?;
-		let cbid = display.wl_sync(wlmm, wlim)?;
+		let id = ctx.borrow_mut().wlim.new_id_registered(WaylandObjectKind::XdgWmBase);
+		registry.wl_bind(id, WaylandObjectKind::XdgWmBase, 1)?;
+		let cbid = display.wl_sync()?;
 
 		let mut done = false;
 		while !done {
-			wlmm.get_events(wlim)?;
+			ctx.borrow_mut().wlmm.get_events()?;
 
-			while let Some(msg) = wlmm.q.pop_front() {
+			while let Some(msg) = ctx.borrow_mut().wlmm.q.pop_front() {
 				if msg.recv_id == cbid {
 					println!("xdg_wm_base callback done");
 					done = true;
@@ -642,19 +641,20 @@ impl XdgWmBase {
 
 		Ok(Self {
 			id,
+			ctx
 		})
 	}
 
-	fn wl_destroy(&self, wlmm: &mut MessageManager) -> Result<(), Box<dyn Error>> {
-		wlmm.send_request(&mut WireRequest {
+	fn wl_destroy(&self) -> Result<(), Box<dyn Error>> {
+		self.ctx.borrow().wlmm.send_request(&mut WireRequest {
 			sender_id: self.id,
 			opcode: 0,
 			args: vec![],
 		})
 	}
 
-	pub fn wl_pong(&self, wlmm: &mut MessageManager, serial: u32) -> Result<(), Box<dyn Error>> {
-		wlmm.send_request(&mut WireRequest {
+	pub fn wl_pong(&self, serial: u32) -> Result<(), Box<dyn Error>> {
+		self.ctx.borrow().wlmm.send_request(&mut WireRequest {
 			sender_id: self.id,
 			opcode: 3,
 			args: vec![WireArgument::UnInt(serial)],
@@ -663,22 +663,18 @@ impl XdgWmBase {
 
 	pub fn destroy(
 		&self,
-		wlmm: &mut MessageManager,
-		wlim: &mut IdentManager,
 	) -> Result<(), Box<dyn Error>> {
-		self.wl_destroy(wlmm)?;
-		wlim.free_id(self.id)?;
+		self.wl_destroy()?;
+		self.ctx.borrow_mut().wlim.free_id(self.id)?;
 		Ok(())
 	}
 
 	fn wl_get_xdg_surface(
 		&self,
-		wl_surface_id: u32,
-		wlmm: &mut MessageManager,
-		wlim: &mut IdentManager,
+		wl_surface_id: Id,
+		xdg_surface_id: Id,
 	) -> Result<u32, Box<dyn Error>> {
-		let xdg_surface_id = wlim.new_id_registered(WaylandObjectKind::XdgSurface);
-		wlmm.send_request(&mut WireRequest {
+		self.ctx.borrow().wlmm.send_request(&mut WireRequest {
 			sender_id: self.id,
 			opcode: 2,
 			args: vec![WireArgument::NewId(xdg_surface_id), WireArgument::Obj(wl_surface_id)],
@@ -686,50 +682,49 @@ impl XdgWmBase {
 		Ok(xdg_surface_id)
 	}
 
-	pub fn make_xdg_surface_from_wl_surface(
+	pub fn make_xdg_surface(
 		&self,
-		wl_surface_id: u32,
-		wlmm: &mut MessageManager,
-		wlim: &mut IdentManager,
+		wl_surface_id: Id,
 	) -> Result<XdgSurface, Box<dyn Error>> {
-		let id = self.wl_get_xdg_surface(wl_surface_id, wlmm, wlim)?;
+		let xdg_surface_id = self.ctx.borrow_mut().wlim.new_id_registered(WaylandObjectKind::XdgSurface);
+		let id = self.wl_get_xdg_surface(wl_surface_id, xdg_surface_id)?;
 		Ok(XdgSurface {
 			id,
+			ctx: self.ctx.clone(),
 		})
 	}
 }
 
 pub struct XdgSurface {
-	id: u32,
+	pub id: Id,
+	ctx: CtxType,
 }
 
 impl XdgSurface {
 	fn wl_get_toplevel(
 		&self,
-		wlmm: &mut MessageManager,
-		wlim: &mut IdentManager,
-	) -> Result<u32, Box<dyn Error>> {
-		let xdg_toplevel_id = wlim.new_id_registered(WaylandObjectKind::XdgTopLevel);
-		wlmm.send_request(&mut WireRequest {
+		xdg_toplevel_id: Id,
+	) -> Result<(), Box<dyn Error>> {
+		self.ctx.borrow().wlmm.send_request(&mut WireRequest {
 			sender_id: self.id,
 			opcode: 1,
 			args: vec![WireArgument::NewId(xdg_toplevel_id)],
-		})?;
-		Ok(xdg_toplevel_id)
+		})
 	}
 
 	pub fn make_xdg_toplevel(
 		&self,
-		wlmm: &mut MessageManager,
-		wlim: &mut IdentManager,
 	) -> Result<XdgTopLevel, Box<dyn Error>> {
-		let id = self.wl_get_toplevel(wlmm, wlim)?;
+		let id = self.ctx.borrow_mut().wlim.new_id_registered(WaylandObjectKind::XdgTopLevel);
+		self.wl_get_toplevel(id)?;
 		Ok(XdgTopLevel {
 			id,
+			ctx: self.ctx.clone(),
 		})
 	}
 }
 
 pub struct XdgTopLevel {
-	id: u32,
+	pub id: Id,
+	ctx: CtxType,
 }

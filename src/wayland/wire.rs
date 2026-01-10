@@ -12,19 +12,20 @@ use std::{
 
 use crate::wayland::{IdentManager, WaylandError, WaylandObjectKind};
 
+pub type Id = u32;
+
 #[derive(Debug)]
 pub struct WireRequest {
-	pub sender_id: u32,
+	pub sender_id: Id,
 	pub opcode: usize,
 	pub args: Vec<WireArgument>,
 }
 
 #[derive(Debug)]
-pub struct WireEvent {
-	pub recv_id: u32,
-	pub recv_obj: WaylandObjectKind,
+pub struct WireEventRaw {
+	pub recv_id: Id,
 	pub opcode: usize,
-	pub args: Vec<WireArgument>,
+	pub payload: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -55,9 +56,10 @@ pub enum WireArgumentKind {
 	FileDescriptor,
 }
 
+#[derive(Debug)]
 pub struct MessageManager {
 	pub sock: UnixStream,
-	pub q: VecDeque<WireEvent>,
+	pub q: VecDeque<WireEventRaw>,
 }
 
 impl Drop for MessageManager {
@@ -89,7 +91,7 @@ impl MessageManager {
 		Ok(self.sock.shutdown(std::net::Shutdown::Both)?)
 	}
 
-	pub fn send_request(&mut self, msg: &mut WireRequest) -> Result<(), Box<dyn Error>> {
+	pub fn send_request(&self, msg: &mut WireRequest) -> Result<(), Box<dyn Error>> {
 		println!("==== SEND_REQUEST CALLED");
 		let mut buf: Vec<u8> = vec![];
 		buf.append(&mut Vec::from(msg.sender_id.to_ne_bytes()));
@@ -147,7 +149,7 @@ impl MessageManager {
 		Ok(Some(len))
 	}
 
-	pub fn get_events(&mut self, wlim: &mut IdentManager) -> Result<(), Box<dyn Error>> {
+	pub fn get_events(&mut self) -> Result<(), Box<dyn Error>> {
 		let mut b = [0; 8192];
 		let len = self.get_socket_data(&mut b)?;
 		if len.is_none() {
@@ -169,90 +171,14 @@ impl MessageManager {
 			}
 			let opcode = (byte2 & 0x0000ffff) as usize;
 
-			let mut args = vec![];
+			let payload = Vec::from(&b[cursor .. cursor + recv_len as usize]);
 
-			// if err occured
-			if sender_id == 1 && opcode == 0 {
-				let obj_id = decode_event_payload(&b[cursor + 8..], WireArgumentKind::Obj)?;
-				let code = decode_event_payload(&b[cursor + 12..], WireArgumentKind::UnInt)?;
-				let message = decode_event_payload(&b[cursor + 16..], WireArgumentKind::String)?;
-				eprintln!("======== ERROR FIRED in wl_display\n{:?}", message);
-				args.push(obj_id);
-				args.push(code);
-				args.push(message);
-			}
-
-			let kind = wlim.idmap.iter().find(|(x, _)| **x == sender_id).map(|(_, y)| y);
-			if let Some(kind) = kind {
-				match kind {
-					WaylandObjectKind::Display => match opcode {
-						1 => {
-							let deleted_id =
-								decode_event_payload(&b[cursor + 8..], WireArgumentKind::UnInt)?;
-							println!(
-								"==================== ID {:?} GOT DELETED (unimpl)",
-								deleted_id
-							);
-							args.push(deleted_id);
-						}
-						_ => {
-							eprintln!("unimplemented display event");
-						}
-					},
-					WaylandObjectKind::Registry => match opcode {
-						0 => {
-							let name =
-								decode_event_payload(&b[cursor + 8..], WireArgumentKind::UnInt)?;
-							let interface =
-								decode_event_payload(&b[cursor + 12..], WireArgumentKind::String)?;
-							let version =
-								decode_event_payload(&b[..len - 4], WireArgumentKind::UnInt)?;
-							args.push(name);
-							args.push(interface);
-							args.push(version);
-						}
-						1 => {
-							let name =
-								decode_event_payload(&b[cursor + 8..], WireArgumentKind::UnInt)?;
-							args.push(name);
-						}
-						_ => {
-							eprintln!("unimplemented registry event");
-						}
-					},
-					WaylandObjectKind::Callback => match opcode {
-						0 => {
-							// let cbdata =
-							// 	decode_event_payload(&b[cursor + 8..], WireArgumentKind::UnInt)?;
-							// args.push(cbdata);
-						}
-						_ => {
-							eprintln!("invalid callback event");
-						}
-					},
-					WaylandObjectKind::SharedMemory => match opcode {
-						0 => {
-							let cbdata =
-								decode_event_payload(&b[cursor + 8..], WireArgumentKind::UnInt)?;
-							args.push(cbdata);
-						}
-						_ => {
-							eprintln!("invalid sharedmemory event");
-						}
-					},
-					r => eprintln!("unimplemented interface {:?}", r),
-				}
-
-				let event = WireEvent {
-					recv_id: sender_id,
-					recv_obj: *kind,
-					opcode,
-					args,
-				};
-				self.q.push_back(event);
-			} else {
-				return Err(WaylandError::ObjectNonExistent.boxed());
-			}
+			let event = WireEventRaw {
+				recv_id: sender_id,
+				opcode,
+				payload,
+			};
+			self.q.push_back(event);
 
 			cursor += recv_len as usize;
 		}

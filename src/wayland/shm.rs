@@ -1,4 +1,4 @@
-use std::{cell::RefCell, collections::HashSet, error::Error, ffi::CString, os::fd::RawFd, rc::Rc};
+use std::{cell::RefCell, collections::HashSet, error::Error, ffi::CString, os::{fd::RawFd, raw::c_void}, ptr::{self, null_mut}, rc::Rc};
 // std depends on libc anyway so i consider using it fair
 // i may replace this with asm in the future but that means amd64 only
 use crate::{
@@ -10,7 +10,7 @@ use crate::{
 		wire::{FromWirePayload, Id, WireArgument, WireRequest},
 	},
 };
-use libc::{O_CREAT, O_RDWR, ftruncate, shm_open, shm_unlink};
+use libc::{MAP_FAILED, MAP_SHARED, O_CREAT, O_RDWR, PROT_READ, PROT_WRITE, ftruncate, mmap, munmap, shm_open, shm_unlink};
 
 #[repr(C)]
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
@@ -60,7 +60,7 @@ impl SharedMemory {
 		Ok(shm)
 	}
 
-	pub fn make_pool(&self, size: i32) -> Result<RcCell<SharedMemoryPool>, Box<dyn Error>> {
+	pub fn make_pool(&mut self, size: i32) -> Result<RcCell<SharedMemoryPool>, Box<dyn Error>> {
 		// add method to get new names
 		let name = CString::new("wl-shm-1")?;
 		let fd = unsafe { shm_open(name.as_ptr(), O_RDWR | O_CREAT, 0) };
@@ -75,6 +75,16 @@ impl SharedMemory {
 			.wlim
 			.new_id_registered(WaylandObjectKind::SharedMemoryPool, shmpool.clone());
 		shmpool.borrow_mut().id = id;
+
+		let ptr = unsafe { mmap(null_mut(), size as usize, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0) };
+		if ptr == MAP_FAILED {
+			return Err(Box::new(std::io::Error::last_os_error()));
+		} else {
+			let x: *mut [u8] = ptr::slice_from_raw_parts_mut(ptr as *mut u8, size as usize);
+			shmpool.borrow_mut().ptr = Some(ptr);
+			shmpool.borrow_mut().slice = Some(x);
+		};
+
 		self.wl_create_pool(size, fd, id)?;
 		Ok(shmpool)
 	}
@@ -102,8 +112,10 @@ pub struct SharedMemoryPool {
 	id: Id,
 	ctx: CtxType,
 	name: CString,
-	size: i32,
+	pub size: i32,
 	fd: RawFd,
+	pub slice: Option<*mut [u8]>,
+	ptr: Option<*mut c_void>,
 }
 
 impl SharedMemoryPool {
@@ -114,6 +126,8 @@ impl SharedMemoryPool {
 			name,
 			size,
 			fd,
+			slice: None,
+			ptr: None,
 		}
 	}
 
@@ -159,6 +173,15 @@ impl SharedMemoryPool {
 		Ok(buf)
 	}
 
+	pub(crate) fn unmap(&self) -> Result<(), std::io::Error> {
+		let r = unsafe { munmap(self.ptr.unwrap(), self.size as usize) };
+		if r == 0 {
+			Ok(())
+		} else {
+			Err(std::io::Error::last_os_error())
+		}
+	}
+
 	pub(crate) fn wl_destroy(&self) -> Result<(), Box<dyn Error>> {
 		self.ctx.borrow().wlmm.send_request(&mut WireRequest {
 			sender_id: self.id,
@@ -179,7 +202,9 @@ impl SharedMemoryPool {
 	pub fn destroy(&self) -> Result<(), Box<dyn Error>> {
 		self.wl_destroy()?;
 		self.ctx.borrow_mut().wlim.free_id(self.id)?;
-		Ok(self.unlink()?)
+		self.unlink()?;
+		self.unmap()?;
+		Ok(())
 	}
 }
 

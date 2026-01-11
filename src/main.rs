@@ -1,9 +1,3 @@
-// TODO it's LATE i'm TIRED
-// - xdg toplevel configure handler
-// - figure out how to send an ack back
-// - DROP
-// - maybe a timeout in the serializer?
-
 use std::{cell::RefCell, env, error::Error, rc::Rc};
 
 use wayland_raw::wayland::{
@@ -28,6 +22,12 @@ fn main() -> Result<(), Box<dyn Error>> {
 	let surface = compositor.borrow_mut().make_surface()?;
 	let shm = SharedMemory::new_bound_initialized(&mut registry.borrow_mut(), ctx.clone())?;
 	let shm_pool = shm.borrow_mut().make_pool(500 * 500 * 4)?;
+	unsafe {
+		let x = &mut *shm_pool.borrow_mut().slice.unwrap();
+		x.chunks_mut(4).for_each(|y| {
+			y[0] = 255;
+		});
+	}
 	ctx.borrow_mut().handle_events()?;
 	let buf = shm_pool.borrow_mut().make_buffer((0, 500, 500, 500), PixelFormat::Xrgb888)?;
 	let xdg_wm_base = XdgWmBase::new_bound(&mut registry.borrow_mut())?;

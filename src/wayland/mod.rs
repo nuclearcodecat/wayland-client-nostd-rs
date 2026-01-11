@@ -40,20 +40,20 @@ impl RecvError {
 }
 
 #[repr(usize)]
-enum DebugLevel {
+pub(crate) enum DebugLevel {
 	Verbose,
 	Important,
 	Severe,
 }
 
-enum EventAction {
+pub(crate) enum EventAction {
 	Request(WireRequest),
 	IdDeletion(Id),
 	Error(Box<dyn Error>),
 	DebugMessage(DebugLevel, String),
 }
 
-pub trait WaylandObject {
+pub(crate) trait WaylandObject {
 	fn handle(
 		&mut self,
 		opcode: OpCode,
@@ -78,16 +78,31 @@ impl Context {
 	}
 
 	pub fn handle_events(&mut self) -> Result<(), Box<dyn Error>> {
-		println!("serializer called");
 		let mut retries = 0;
 		while self.wlmm.get_events()? == 0 && retries < 9999 {
 			retries += 1;
 		}
+		let mut actions: Vec<EventAction> = vec![];
 		while let Some(ev) = self.wlmm.q.pop_front() {
 			let obj =
 				self.wlim.find_obj_by_id(ev.recv_id).ok_or(WaylandError::ObjectNonExistent)?;
 			println!("going to handle {:?}", obj.0);
-			obj.1.borrow_mut().handle(ev.opcode, &ev.payload)?;
+			let mut x = obj.1.borrow_mut().handle(ev.opcode, &ev.payload)?;
+			actions.append(&mut x);
+		};
+		for act in actions {
+			match act {
+				EventAction::Request(mut msg) => {
+					self.wlmm.send_request(&mut msg)?;
+				},
+				EventAction::IdDeletion(id) => {
+					self.wlim.free_id(id)?;
+				},
+				// add colors
+				EventAction::Error(er) => eprintln!("{:?}", er),
+				// add colors
+				EventAction::DebugMessage(_, msg) => println!("{msg}"),
+			};
 		}
 		Ok(())
 	}
@@ -138,19 +153,19 @@ pub struct IdentManager {
 }
 
 impl IdentManager {
-	fn new_id(&mut self) -> Id {
+	pub(crate) fn new_id(&mut self) -> Id {
 		self.top_id += 1;
 		println!("! idman ! new id picked: {}", self.top_id);
 		self.top_id
 	}
 
-	fn new_id_registered(&mut self, kind: WaylandObjectKind, obj: Wlto) -> Id {
+	pub(crate) fn new_id_registered(&mut self, kind: WaylandObjectKind, obj: Wlto) -> Id {
 		let id = self.new_id();
 		self.idmap.insert(id, (kind, obj));
 		id
 	}
 
-	fn free_id(&mut self, id: Id) -> Result<(), Box<dyn Error>> {
+	pub(crate) fn free_id(&mut self, id: Id) -> Result<(), Box<dyn Error>> {
 		let registered = self.idmap.iter().find(|(k, _)| **k == id).map(|(k, _)| k).copied();
 		if let Some(r) = registered {
 			self.idmap.remove(&r).ok_or(WaylandError::IdMapRemovalFail.boxed())?;
@@ -160,11 +175,11 @@ impl IdentManager {
 	}
 
 	// ugh
-	pub fn find_obj_by_id(&self, id: Id) -> Option<&(WaylandObjectKind, Wlto)> {
+	pub(crate) fn find_obj_by_id(&self, id: Id) -> Option<&(WaylandObjectKind, Wlto)> {
 		self.idmap.iter().find(|(k, _)| **k == id).map(|(_, v)| v)
 	}
 
-	pub fn find_obj_kind_by_id(&self, id: Id) -> Option<WaylandObjectKind> {
+	pub(crate) fn find_obj_kind_by_id(&self, id: Id) -> Option<WaylandObjectKind> {
 		self.idmap.iter().find(|(k, _)| **k == id).map(|(_, v)| v.0)
 	}
 }
